@@ -1,0 +1,13 @@
+.github
+examples
+images
+node_modules
+scripts
+src
+tests
+.eslintignore
+.gitignore
+.prettierignore
+.prettierrc
+eslint.config.mts
+tsconfig.json
