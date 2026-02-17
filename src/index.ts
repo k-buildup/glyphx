@@ -1277,7 +1277,778 @@ export class Textarea extends Widget implements IFocusable {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  § 9. CONTAINER
+//  § 9. Chart
+// ══════════════════════════════════════════════════════════════════════════════
+
+export interface ITerminalWriter {
+    moveTo(row: number, col: number): void;
+    write(text: string): void;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 1.  BrailleCanvas  ─ 픽셀 ↔ 점자 변환 엔진
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 점자 코드포인트 기준 도트 비트 배치
+ *
+ *   col→   0      1
+ * row↓
+ *   0    bit0   bit3
+ *   1    bit1   bit4
+ *   2    bit2   bit5
+ *   3    bit6   bit7
+ *
+ * U+2800 (⠀) + bits → 점자 문자
+ * 각 터미널 셀 1칸 = 가로 2픽셀 × 세로 4픽셀
+ */
+const BRAILLE_BITS: number[][] = [
+    [0x01, 0x08], // row 0
+    [0x02, 0x10], // row 1
+    [0x04, 0x20], // row 2
+    [0x40, 0x80], // row 3
+];
+
+class BrailleCanvas {
+    /** 픽셀 버퍼: pixels[py][px] */
+    private pixels: boolean[][];
+    /** 컬러 버퍼: colors[py][px] (chalk 색상 이름) */
+    private colors: (string | null)[][];
+
+    constructor(
+        /** 터미널 문자 열 수 */
+        readonly cols: number,
+        /** 터미널 문자 행 수 */
+        readonly rows: number,
+    ) {
+        const ph = rows * 4;
+        const pw = cols * 2;
+        this.pixels = Array.from({ length: ph }, () =>
+            new Array<boolean>(pw).fill(false),
+        );
+        this.colors = Array.from({ length: ph }, () =>
+            new Array<string | null>(pw).fill(null),
+        );
+    }
+
+    get pixelWidth() {
+        return this.cols * 2;
+    }
+    get pixelHeight() {
+        return this.rows * 4;
+    }
+
+    clear(): void {
+        for (const row of this.pixels) row.fill(false);
+        for (const row of this.colors) row.fill(null);
+    }
+
+    setPixel(px: number, py: number, color: string | null = "white"): void {
+        if (px < 0 || px >= this.pixelWidth || py < 0 || py >= this.pixelHeight)
+            return;
+        this.pixels[py]![px] = true;
+        this.colors[py]![px] = color;
+    }
+
+    /** 지정 터미널 셀(col, row)의 점자 문자 + 대표 색상 반환 */
+    getCell(col: number, row: number): { ch: string; color: string } {
+        let bits = 0;
+        let color = "gray";
+        let found = false;
+        for (let r = 0; r < 4; r++) {
+            for (let c = 0; c < 2; c++) {
+                const py = row * 4 + r;
+                const px = col * 2 + c;
+                if (this.pixels[py]?.[px]) {
+                    bits |= BRAILLE_BITS[r]![c]!;
+                    if (!found) {
+                        color = this.colors[py]?.[px] ?? "white";
+                        found = true;
+                    }
+                }
+            }
+        }
+        return { ch: String.fromCharCode(0x2800 + bits), color };
+    }
+
+    /**
+     * 터미널 행 전체를 chalk 컬러 문자열로 반환.
+     * 인접한 같은 색 셀은 묶어서 출력 효율을 높입니다.
+     */
+    getRow(row: number): string {
+        let out = "";
+        let runColor = "";
+        let runStr = "";
+        const flush = () => {
+            if (runStr) out += chalk.keyword(runColor)(runStr);
+            runStr = "";
+        };
+        for (let col = 0; col < this.cols; col++) {
+            const { ch, color } = this.getCell(col, row);
+            if (color !== runColor) {
+                flush();
+                runColor = color;
+            }
+            runStr += ch;
+        }
+        flush();
+        return out;
+    }
+
+    // ── 드로잉 프리미티브 ──────────────────────────────────────────────────────
+
+    /** Bresenham 직선 */
+    drawLine(
+        x0: number,
+        y0: number,
+        x1: number,
+        y1: number,
+        color = "white",
+    ): void {
+        const dx = Math.abs(x1 - x0),
+            dy = Math.abs(y1 - y0);
+        const sx = x0 < x1 ? 1 : -1,
+            sy = y0 < y1 ? 1 : -1;
+        let err = dx - dy;
+        for (;;) {
+            this.setPixel(x0, y0, color);
+            if (x0 === x1 && y0 === y1) break;
+            const e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                x0 += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    /** 원형 점 (반지름 r 픽셀) */
+    drawDot(cx: number, cy: number, r = 1, color = "white"): void {
+        for (let dy = -r; dy <= r; dy++)
+            for (let dx = -r; dx <= r; dx++)
+                if (dx * dx + dy * dy <= r * r)
+                    this.setPixel(cx + dx, cy + dy, color);
+    }
+
+    /** 채워진 수직 막대: (x, bottom) ~ (x, top) */
+    drawBar(
+        x: number,
+        bottom: number,
+        top: number,
+        w: number,
+        color = "white",
+    ): void {
+        for (let px = x; px < x + w; px++)
+            for (let py = top; py <= bottom; py++) this.setPixel(px, py, color);
+    }
+
+    /**
+     * 채워진 파이 섹터
+     * @param cx, cy  중심 픽셀
+     * @param r       반지름 픽셀
+     * @param a0, a1  시작/끝 라디안 (0 = 우측, 반시계)
+     */
+    drawSector(
+        cx: number,
+        cy: number,
+        r: number,
+        a0: number,
+        a1: number,
+        color = "white",
+    ): void {
+        for (let py = -r; py <= r; py++) {
+            for (let px = -r; px <= r; px++) {
+                if (px * px + py * py > r * r) continue;
+                const ang = Math.atan2(py, px);
+                // 범위를 a0~a1 으로 정규화 (wrap-around 처리)
+                let da = ang - a0;
+                while (da < 0) da += Math.PI * 2;
+                while (da > Math.PI * 2) da -= Math.PI * 2;
+                let span = a1 - a0;
+                while (span < 0) span += Math.PI * 2;
+                while (span > Math.PI * 2) span -= Math.PI * 2;
+                if (da <= span) this.setPixel(cx + px, cy + py, color);
+            }
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 2.  공용 타입 / 헬퍼
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 단일 시리즈 데이터 */
+export interface Series {
+    values: number[];
+    label?: string;
+    color?: string;
+}
+
+/** 산점도 점 */
+export interface Point {
+    x: number;
+    y: number;
+}
+
+export interface ScatterSeries {
+    points: Point[];
+    label?: string;
+    color?: string;
+}
+
+/** 원 그래프 슬라이스 */
+export interface Slice {
+    value: number;
+    label?: string;
+    color?: string;
+}
+
+const PALETTE = ["cyan", "yellow", "green", "magenta", "red", "blue", "white"];
+const color = (i: number, override?: string) =>
+    override ?? PALETTE[i % PALETTE.length]!;
+
+/** 테두리 그리기 공통 헬퍼 */
+function renderBorder(
+    writer: ITerminalWriter,
+    li: number,
+    row: number,
+    col: number,
+    w: number,
+    h: number,
+    title: string,
+): boolean {
+    if (li === 0) {
+        const inner = w - 1;
+        const t = title.slice(0, inner - 2);
+        const pad = "─".repeat(Math.max(0, inner - t.length - 2));
+        writer.moveTo(row, col);
+        writer.write(
+            chalk.gray("┌─") + chalk.white.bold(t) + chalk.gray(pad + "┐"),
+        );
+        return true;
+    }
+    if (li === h - 1) {
+        writer.moveTo(row, col);
+        writer.write(chalk.gray("└" + "─".repeat(w - 2) + "┘"));
+        return true;
+    }
+    return false;
+}
+
+/** 축 레이블 (최솟값 / 최댓값) */
+function axisLabels(min: number, max: number, w: number): string {
+    const lo = formatNum(min);
+    const hi = formatNum(max);
+    const space = Math.max(0, w - lo.length - hi.length);
+    return chalk.gray(lo + " ".repeat(space) + hi);
+}
+
+function formatNum(n: number): string {
+    if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    if (Number.isInteger(n)) return String(n);
+    return n.toFixed(2);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 3.  LineChart  —  꺾은선 그래프
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 꺾은선 그래프
+ *
+ * 레이아웃 (height 행):
+ *  row 0         : 타이틀 테두리
+ *  row 1 ~ h-3   : 브레일 캔버스 (ih = height-3 행)
+ *  row h-2       : X축 레이블
+ *  row h-1       : 하단 테두리
+ */
+export class LineChart extends Widget {
+    private _canvas: BrailleCanvas;
+    private _dirty = true;
+    private _min = 0;
+    private _max = 1;
+
+    constructor(
+        private readonly width: number,
+        private readonly height: number,
+        private series: Series[],
+        private title = "Line Chart",
+        writer?: ITerminalWriter,
+    ) {
+        super(writer);
+        const canvasCols = width - 2; // 테두리 좌우 1씩
+        const canvasRows = height - 3; // 테두리 상하 + 축 레이블
+        this._canvas = new BrailleCanvas(canvasCols, canvasRows);
+    }
+
+    lineCount() {
+        return this.height;
+    }
+    naturalWidth() {
+        return this.width;
+    }
+
+    /** 런타임에 데이터 교체 */
+    setSeries(s: Series[]): void {
+        this.series = s;
+        this._dirty = true;
+    }
+
+    private _render(): void {
+        if (!this._dirty) return;
+        this._dirty = false;
+        this._canvas.clear();
+
+        const all = this.series.flatMap((s) => s.values);
+        if (all.length === 0) return;
+
+        this._min = Math.min(...all);
+        this._max = Math.max(...all);
+        const range = this._max - this._min || 1;
+
+        const pw = this._canvas.pixelWidth;
+        const ph = this._canvas.pixelHeight;
+
+        const toX = (i: number, len: number) =>
+            Math.round((i / Math.max(len - 1, 1)) * (pw - 1));
+        const toY = (v: number) =>
+            Math.round((1 - (v - this._min) / range) * (ph - 1));
+
+        for (let si = 0; si < this.series.length; si++) {
+            const s = this.series[si]!;
+            const c = color(si, s.color);
+            for (let i = 1; i < s.values.length; i++) {
+                this._canvas.drawLine(
+                    toX(i - 1, s.values.length),
+                    toY(s.values[i - 1]!),
+                    toX(i, s.values.length),
+                    toY(s.values[i]!),
+                    c,
+                );
+            }
+            // 마지막 점 강조
+            const last = s.values.length - 1;
+            this._canvas.drawDot(
+                toX(last, s.values.length),
+                toY(s.values[last]!),
+                2,
+                c,
+            );
+        }
+    }
+
+    renderLine(li: number, row: number, col: number, maxWidth: number): void {
+        this._render();
+        const w = Math.min(this.width, maxWidth);
+        const h = this.height;
+
+        if (renderBorder(this.writer, li, row, col, w, h, this.title)) return;
+
+        // 축 레이블 행 (h-2)
+        if (li === h - 2) {
+            this.writer.moveTo(row, col);
+            this.writer.write(
+                chalk.gray("│") +
+                    axisLabels(this._min, this._max, w - 2) +
+                    chalk.gray("│"),
+            );
+            return;
+        }
+
+        // 캔버스 행 (1 ~ h-3)
+        const canvasRow = li - 1;
+        this.writer.moveTo(row, col);
+        this.writer.write(
+            chalk.gray("│") + this._canvas.getRow(canvasRow) + chalk.gray("│"),
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 4.  ScatterChart  —  산점도 그래프
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 산점도 그래프
+ *
+ * 각 점을 작은 원(반지름 1px)으로 표시합니다.
+ */
+export class ScatterChart extends Widget {
+    private _canvas: BrailleCanvas;
+    private _dirty = true;
+    private _xMin = 0;
+    private _xMax = 1;
+    private _yMin = 0;
+    private _yMax = 1;
+
+    constructor(
+        private readonly width: number,
+        private readonly height: number,
+        private series: ScatterSeries[],
+        private title = "Scatter Chart",
+        writer?: ITerminalWriter,
+    ) {
+        super(writer);
+        const canvasCols = width - 2;
+        const canvasRows = height - 4; // 위 테두리 + 아래 테두리 + X레이블 + Y레이블
+        this._canvas = new BrailleCanvas(canvasCols, canvasRows);
+    }
+
+    lineCount() {
+        return this.height;
+    }
+    naturalWidth() {
+        return this.width;
+    }
+
+    setSeries(s: ScatterSeries[]): void {
+        this.series = s;
+        this._dirty = true;
+    }
+
+    private _render(): void {
+        if (!this._dirty) return;
+        this._dirty = false;
+        this._canvas.clear();
+
+        const allX = this.series.flatMap((s) => s.points.map((p) => p.x));
+        const allY = this.series.flatMap((s) => s.points.map((p) => p.y));
+        if (allX.length === 0) return;
+
+        this._xMin = Math.min(...allX);
+        this._xMax = Math.max(...allX);
+        this._yMin = Math.min(...allY);
+        this._yMax = Math.max(...allY);
+        const xRange = this._xMax - this._xMin || 1;
+        const yRange = this._yMax - this._yMin || 1;
+
+        const pw = this._canvas.pixelWidth;
+        const ph = this._canvas.pixelHeight;
+
+        const toX = (x: number) =>
+            Math.round(((x - this._xMin) / xRange) * (pw - 1));
+        const toY = (y: number) =>
+            Math.round((1 - (y - this._yMin) / yRange) * (ph - 1));
+
+        for (let si = 0; si < this.series.length; si++) {
+            const s = this.series[si]!;
+            const c = color(si, s.color);
+            for (const p of s.points)
+                this._canvas.drawDot(toX(p.x), toY(p.y), 1, c);
+        }
+    }
+
+    renderLine(li: number, row: number, col: number, maxWidth: number): void {
+        this._render();
+        const w = Math.min(this.width, maxWidth);
+        const h = this.height;
+        const iw = w - 2;
+
+        if (renderBorder(this.writer, li, row, col, w, h, this.title)) return;
+
+        // X 축 레이블 (h-2)
+        if (li === h - 2) {
+            this.writer.moveTo(row, col);
+            this.writer.write(
+                chalk.gray("│") +
+                    axisLabels(this._xMin, this._xMax, iw) +
+                    chalk.gray("│"),
+            );
+            return;
+        }
+
+        // 범례 행 (h-3)  — 시리즈명 나열
+        if (li === h - 3) {
+            let legend = "";
+            for (let si = 0; si < this.series.length; si++) {
+                const s = this.series[si]!;
+                const c = color(si, s.color);
+                const lbl = (s.label ?? `S${si + 1}`).slice(0, 8);
+                legend += chalk.keyword(c)(`● ${lbl}  `);
+            }
+            const pad = Math.max(
+                0,
+                // eslint-disable-next-line no-control-regex
+                iw - legend.replace(/\x1b\[[^m]*m/g, "").length,
+            );
+            this.writer.moveTo(row, col);
+            this.writer.write(
+                chalk.gray("│") + legend + " ".repeat(pad) + chalk.gray("│"),
+            );
+            return;
+        }
+
+        // 캔버스 행 (1 ~ h-4)
+        const canvasRow = li - 1;
+        this.writer.moveTo(row, col);
+        this.writer.write(
+            chalk.gray("│") + this._canvas.getRow(canvasRow) + chalk.gray("│"),
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 5.  BarChart  —  막대 그래프
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 수직 막대 그래프
+ *
+ * 각 막대 = 1 터미널 문자 폭 (= 2픽셀)
+ * 막대 사이 간격 = 1 터미널 문자
+ */
+export class BarChart extends Widget {
+    private _canvas: BrailleCanvas;
+    private _dirty = true;
+    private _max = 1;
+
+    constructor(
+        private readonly width: number,
+        private readonly height: number,
+        private values: number[],
+        private labels: string[],
+        private title = "Bar Chart",
+        private barColor = "cyan",
+        writer?: ITerminalWriter,
+    ) {
+        super(writer);
+        const canvasCols = width - 2;
+        const canvasRows = height - 3;
+        this._canvas = new BrailleCanvas(canvasCols, canvasRows);
+    }
+
+    lineCount() {
+        return this.height;
+    }
+    naturalWidth() {
+        return this.width;
+    }
+
+    setData(values: number[], labels: string[]): void {
+        this.values = values;
+        this.labels = labels;
+        this._dirty = true;
+    }
+
+    private _render(): void {
+        if (!this._dirty) return;
+        this._dirty = false;
+        this._canvas.clear();
+
+        if (this.values.length === 0) return;
+
+        this._max = Math.max(...this.values, 0.001);
+        const pw = this._canvas.pixelWidth;
+        const ph = this._canvas.pixelHeight;
+        const n = this.values.length;
+
+        // 막대 폭(픽셀) 과 간격을 균등 분배
+        const totalPx = pw;
+        const barPx = Math.max(1, Math.floor(totalPx / (n * 2))); // 막대 1개 픽셀 폭
+        const gapPx = Math.max(0, Math.floor((totalPx - barPx * n) / (n + 1)));
+
+        let x = gapPx;
+        for (let i = 0; i < n; i++) {
+            const barH = Math.round((this.values[i]! / this._max) * (ph - 1));
+            const top = ph - 1 - barH;
+            // 막대 색상: 같은 색이나 팔레트에서 순환 가능
+            const c = PALETTE[i % PALETTE.length]!;
+            this._canvas.drawBar(x, ph - 1, top, barPx, c);
+            x += barPx + gapPx;
+        }
+    }
+
+    renderLine(li: number, row: number, col: number, maxWidth: number): void {
+        this._render();
+        const w = Math.min(this.width, maxWidth);
+        const h = this.height;
+        const iw = w - 2;
+
+        if (renderBorder(this.writer, li, row, col, w, h, this.title)) return;
+
+        // 레이블 행 (h-2)
+        if (li === h - 2) {
+            const n = this.values.length;
+            // 균등 분배 레이블
+            const slot = Math.max(1, Math.floor(iw / n));
+            let lbl = "";
+            for (let i = 0; i < n; i++) {
+                const c = PALETTE[i % PALETTE.length]!;
+                const t = (this.labels[i] ?? `${i + 1}`)
+                    .slice(0, slot - 1)
+                    .padEnd(slot);
+                lbl += chalk.keyword(c)(t);
+            }
+            // eslint-disable-next-line no-control-regex
+            const raw = lbl.replace(/\x1b\[[^m]*m/g, "");
+            lbl += " ".repeat(Math.max(0, iw - raw.length));
+            this.writer.moveTo(row, col);
+            this.writer.write(chalk.gray("│") + lbl + chalk.gray("│"));
+            return;
+        }
+
+        // 캔버스 행 (1 ~ h-3)
+        const canvasRow = li - 1;
+        this.writer.moveTo(row, col);
+        this.writer.write(
+            chalk.gray("│") + this._canvas.getRow(canvasRow) + chalk.gray("│"),
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 6.  PieChart  —  원 그래프
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 원 그래프
+ *
+ * 픽셀 종횡비(2:1) 보정을 위해 Y 반지름을 X 반지름의 절반으로 씁니다.
+ */
+export class PieChart extends Widget {
+    private _canvas: BrailleCanvas;
+    private _dirty = true;
+    private _legendLines: string[] = [""];
+
+    constructor(
+        private readonly width: number,
+        private readonly height: number,
+        private slices: Slice[],
+        private title = "Pie Chart",
+        writer?: ITerminalWriter,
+    ) {
+        super(writer);
+        const canvasCols = width - 2;
+        const canvasRows = height - 3; // 테두리 상하 + 범례
+        this._canvas = new BrailleCanvas(canvasCols, canvasRows);
+    }
+
+    lineCount() {
+        return this.height;
+    }
+    naturalWidth() {
+        return this.width;
+    }
+
+    setSlices(s: Slice[]): void {
+        this.slices = s;
+        this._dirty = true;
+    }
+
+    private _computeLegend(iw: number): string[] {
+        const total = this.slices.reduce((s, sl) => s + sl.value, 0);
+        const lines: string[] = [];
+        let currentLine = "";
+        let currentRawLen = 0;
+
+        for (let si = 0; si < this.slices.length; si++) {
+            const sl = this.slices[si]!;
+            const c = color(si, sl.color);
+            const pct =
+                total > 0 ? ((sl.value / total) * 100).toFixed(0) + "%" : "0%";
+            const lbl = (sl.label ?? `S${si + 1}`).slice(0, 8);
+            const segment = `⬤ ${lbl} ${pct}  `;
+
+            if (currentRawLen + segment.length > iw && currentLine) {
+                lines.push(currentLine);
+                currentLine = chalk.keyword(c)(segment);
+                currentRawLen = segment.length;
+            } else {
+                currentLine += chalk.keyword(c)(segment);
+                currentRawLen += segment.length;
+            }
+        }
+        if (currentLine) lines.push(currentLine);
+        return lines.length > 0 ? lines : [""];
+    }
+
+    private _render(): void {
+        if (!this._dirty) return;
+        this._dirty = false;
+
+        const iw = this.width - 2;
+        this._legendLines = this._computeLegend(iw);
+
+        // 범례 줄 수에 맞춰 캔버스 재생성
+        const canvasCols = this.width - 2;
+        const canvasRows = Math.max(
+            1,
+            this.height - 2 - this._legendLines.length,
+        );
+        this._canvas = new BrailleCanvas(canvasCols, canvasRows);
+
+        const total = this.slices.reduce((s, sl) => s + sl.value, 0);
+        if (total === 0) return;
+
+        const pw = this._canvas.pixelWidth;
+        const ph = this._canvas.pixelHeight;
+        const cx = Math.floor(pw / 2);
+        const cy = Math.floor(ph / 2);
+        const rx = Math.floor(Math.min(pw, ph * 2) / 2) - 1;
+
+        let angle = -Math.PI / 2;
+        for (let si = 0; si < this.slices.length; si++) {
+            const sl = this.slices[si]!;
+            const span = (sl.value / total) * Math.PI * 2;
+            const c = color(si, sl.color);
+            const a0 = angle;
+            for (let py = -rx; py <= rx; py++) {
+                for (let px = -rx; px <= rx; px++) {
+                    const ey = py * 2;
+                    if (px * px + ey * ey > rx * rx) continue;
+                    const ang = Math.atan2(ey, px);
+                    let da = ang - a0;
+                    while (da < 0) da += Math.PI * 2;
+                    while (da >= Math.PI * 2) da -= Math.PI * 2;
+                    let sp = span;
+                    while (sp < 0) sp += Math.PI * 2;
+                    if (da <= sp) this._canvas.setPixel(cx + px, cy + py, c);
+                }
+            }
+            angle += span;
+        }
+    }
+
+    renderLine(li: number, row: number, col: number, maxWidth: number): void {
+        this._render();
+        const w = Math.min(this.width, maxWidth);
+        const h = this.height;
+        const iw = w - 2;
+
+        if (renderBorder(this.writer, li, row, col, w, h, this.title)) return;
+
+        // 범례 행들: (h - 1 - legendCount) ~ (h - 2)
+        const legendCount = this._legendLines.length;
+        const legendStart = h - 1 - legendCount;
+
+        if (li >= legendStart && li <= h - 2) {
+            const legendIdx = li - legendStart;
+            const line = this._legendLines[legendIdx] ?? "";
+            // eslint-disable-next-line no-control-regex
+            const raw = line.replace(/\x1b\[[^m]*m/g, "");
+            const pad = Math.max(0, iw - raw.length);
+            this.writer.moveTo(row, col);
+            this.writer.write(
+                chalk.gray("│") + line + " ".repeat(pad) + chalk.gray("│"),
+            );
+            return;
+        }
+
+        // 캔버스 행 (1 ~ legendStart - 1)
+        const canvasRow = li - 1;
+        this.writer.moveTo(row, col);
+        this.writer.write(
+            chalk.gray("│") + this._canvas.getRow(canvasRow) + chalk.gray("│"),
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  § 10. CONTAINER
 //       SRP: rendering, focus management, and scrolling are now separate.
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -1480,13 +2251,18 @@ export class Container extends Widget {
 
         // ── Content rows + vertical scrollbar ────────────────────────────────
 
-        const vThumbH = Math.max(1, Math.round((ih / Math.max(tl, 1)) * ih));
+        // Compute vertical thumb geometry only when scrollable
+        const vThumbH =
+            msY > 0 ? Math.max(1, Math.round((ih / Math.max(tl, 1)) * ih)) : 0;
         const vThumbTop =
             msY > 0 ? Math.round((this._scroll.y / msY) * (ih - vThumbH)) : 0;
 
         for (let i = 0; i < ih; i++) {
-            const isThumb = i >= vThumbTop && i < vThumbTop + vThumbH;
-            const sbChar = isThumb ? chalk.white("┃") : chalk.gray("║");
+            const isThumb =
+                msY > 0 && i >= vThumbTop && i < vThumbTop + vThumbH;
+            // Show scrollbar track/thumb only when content overflows vertically
+            const sbChar =
+                msY > 0 ? (isThumb ? chalk.white("┃") : chalk.gray("║")) : " ";
             this.writer.moveTo(row + 1 + i, col);
             this.writer.write(b("│") + " ".repeat(iw) + sbChar + " " + b("│"));
         }
@@ -1513,21 +2289,25 @@ export class Container extends Widget {
         // ── Horizontal scrollbar ──────────────────────────────────────────────
 
         const hTrackLen = iw - 1;
-        const hThumbLen =
-            mlw > 0
-                ? Math.max(1, Math.round((cw / mlw) * hTrackLen))
-                : hTrackLen;
-        const hThumbPos =
-            msX > 0
-                ? Math.round((this._scroll.x / msX) * (hTrackLen - hThumbLen))
-                : 0;
 
+        // Build horizontal scrollbar row: show bar only when scrollable
         let bar = "";
-        for (let i = 0; i < hTrackLen; i++) {
-            bar +=
-                i >= hThumbPos && i < hThumbPos + hThumbLen
-                    ? chalk.white("━")
-                    : chalk.gray("═");
+        if (msX > 0) {
+            const hThumbLen =
+                mlw > 0
+                    ? Math.max(1, Math.round((cw / mlw) * hTrackLen))
+                    : hTrackLen;
+            const hThumbPos = Math.round(
+                (this._scroll.x / msX) * (hTrackLen - hThumbLen),
+            );
+            for (let i = 0; i < hTrackLen; i++) {
+                bar +=
+                    i >= hThumbPos && i < hThumbPos + hThumbLen
+                        ? chalk.white("━")
+                        : chalk.gray("═");
+            }
+        } else {
+            bar = " ".repeat(hTrackLen);
         }
         bar += chalk.gray("╝");
 
@@ -1542,7 +2322,7 @@ export class Container extends Widget {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  § 10. CONTAINER GROUP
+//  § 11. CONTAINER GROUP
 // ══════════════════════════════════════════════════════════════════════════════
 
 export class ContainerGroup {
