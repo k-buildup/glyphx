@@ -25,6 +25,10 @@ import {
     Event,
     ContainerStyle,
     Textarea,
+    LineChart,
+    ScatterChart,
+    BarChart,
+    PieChart,
 } from "../src";
 import * as readline from "readline";
 import chalk from "chalk";
@@ -108,22 +112,72 @@ const group = new ContainerGroup(allContainers);
 
 const COLS = [1, 34, 67] as const;
 
+// ── 꺾은선 ────────────────────────────────────────────────────────────────
+const lineChart = new LineChart(24, 8, [
+    {
+        values: [3, 7, 2, 9, 5, 11, 8, 14, 6, 12],
+        label: "Sales",
+        color: "cyan",
+    },
+    {
+        values: [1, 4, 6, 3, 8, 5, 9, 7, 10, 8],
+        label: "Profit",
+        color: "yellow",
+    },
+]);
+
+// ── 산점도 ────────────────────────────────────────────────────────────────
+const scatter = new ScatterChart(24, 8, [
+    {
+        points: Array.from({ length: 20 }, () => ({
+            x: Math.random() * 10,
+            y: Math.random() * 10,
+        })),
+        label: "A",
+        color: "green",
+    },
+    {
+        points: Array.from({ length: 15 }, () => ({
+            x: Math.random() * 10 + 2,
+            y: Math.random() * 5 + 3,
+        })),
+        label: "B",
+        color: "magenta",
+    },
+]);
+
+// ── 막대 ──────────────────────────────────────────────────────────────────
+const bar = new BarChart(
+    24,
+    8,
+    [42, 87, 35, 68, 91, 54, 76, 23],
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug"],
+);
+
+// ── 원 ────────────────────────────────────────────────────────────────────
+const pie = new PieChart(24, 8, [
+    { value: 35, label: "Chrome", color: "cyan" },
+    { value: 28, label: "Safari", color: "yellow" },
+    { value: 18, label: "Firefox", color: "green" },
+    { value: 11, label: "Edge", color: "magenta" },
+    { value: 8, label: "Others", color: "gray" },
+]);
+
 function render(): void {
     for (let i = 0; i < allContainers.length; i++) {
         allContainers[i]!.renderAt(1, COLS[i] ?? 1);
     }
-    Cursor.moveTo(20, 1);
+
+    for (let i = 0; i < lineChart.lineCount(); i++)
+        lineChart.renderLine(i, 1 + i, 100, 80);
+    for (let i = 0; i < scatter.lineCount(); i++)
+        scatter.renderLine(i, 9 + i, 100, 80);
+    for (let i = 0; i < bar.lineCount(); i++) bar.renderLine(i, 1 + i, 125, 80);
+    for (let i = 0; i < pie.lineCount(); i++) pie.renderLine(i, 9 + i, 125, 80);
+
+    Cursor.moveTo(process.stdout.columns - 1, 1);
     process.stdout.write(
-        chalk.gray("  ←/→ ") +
-            chalk.white("switch panels") +
-            chalk.gray("  ↵ ") +
-            chalk.white("enter panel") +
-            chalk.gray("  ⇥ ") +
-            chalk.white("next field") +
-            chalk.gray("  ⎋ ") +
-            chalk.white("back") +
-            chalk.gray("  ⌃C ") +
-            chalk.white("quit"),
+        chalk`{gray  ←/→ }{white  switch panels }{gray  ↵ }{white  enter panel }{gray  ⇥ }{white  next field }{gray  ⎋ }{white  back }{gray  ⌃C }{white  quit }`,
     );
 }
 
