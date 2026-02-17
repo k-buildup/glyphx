@@ -11,3 +11,5 @@ tests
 .prettierrc
 eslint.config.mts
 tsconfig.json
+CHANGELOG.md
+LICENSE
